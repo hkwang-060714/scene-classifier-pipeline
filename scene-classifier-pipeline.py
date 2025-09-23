@@ -442,6 +442,34 @@ def get_image_files_from_jsonl(jsonl_file_path: str):
         print(f"读取 JSONL 文件时发生错误: {e}")
         return []
 
+# --- 新增辅助函数用于断点续传和自动保存 (JSONL格式) ---
+def save_partial_results(partial_results, temp_file_path, lock):
+    """线程安全地保存部分结果到临时文件 (JSONL格式)"""
+    with lock: # 使用传入的锁确保写入安全
+        try:
+            # 将整个 partial_results 对象作为一行 JSON 写入
+            with open(temp_file_path, 'w', encoding='utf-8') as f:
+                json.dump(partial_results, f, ensure_ascii=False)
+                f.write('\n') # 确保是JSONL格式
+        except Exception as e:
+            print(f"[警告] 保存部分结果失败: {e}")
+
+def load_partial_results(temp_file_path):
+    """加载部分结果 (JSONL格式)"""
+    if os.path.exists(temp_file_path):
+        try:
+            with open(temp_file_path, 'r', encoding='utf-8') as f:
+                # 读取第一行（也是唯一一行）JSON
+                first_line = f.readline().strip()
+                if first_line:
+                    data = json.loads(first_line)
+                    print(f"[信息] 检测到临时文件，已加载 {len(data.get('results', []))} 条部分结果。")
+                    return data
+            print(f"[警告] 临时文件 {temp_file_path} 为空。")
+        except Exception as e:
+            print(f"[警告] 加载临时文件失败: {e}，将重新开始处理。")
+    return None
+
 # --- 修改后的主处理函数 ---
 def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_dir: str = None,
                                                 sample_count: int = 2, sample_method: str = "random",
@@ -485,7 +513,7 @@ def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_d
 
     # --- 断点续传和自动保存准备 ---
     # 使用固定文件名
-    temp_file_name = "resume_checkpoint.json"  # <<<--- 固定的断点续传文件名
+    temp_file_name = "resume_checkpoint.jsonl"  # <<<--- 修改为JSONL格式
     temp_file_path = os.path.join(output_dir or os.path.dirname(root_folder_path), temp_file_name)
     partial_results_lock = Lock() # 用于保护临时文件写入的锁
     loaded_partial_data = load_partial_results(temp_file_path)
@@ -558,8 +586,8 @@ def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_d
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # 创建详细日志文件
-    log_file = os.path.join(output_dir or os.path.dirname(root_folder_path), f"classification_log_from_jsonl.txt")
+    # 创建详细日志文件 (保持为文本格式)
+    log_file = os.path.join(output_dir or os.path.dirname(root_folder_path), f"classification_log.txt")
 
     # --- 开始并行处理 ---
     start_time = time.time()
@@ -718,30 +746,20 @@ def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_d
         log.write(f"总耗时: {end_time - start_time:.2f} 秒\n")
         log.write(f"平均每张: {(end_time - start_time)/(len(all_images) + len(processed_indices_set)):.2f} 秒\n") # 包含已处理的
 
-    # 保存全局结果到JSON文件
+    # 保存全局结果到JSONL文件
     if output_dir:
-        result_file = os.path.join(output_dir, f"classification_results_from_jsonl.json")
+        result_file = os.path.join(output_dir, f"classification_results.jsonl") # <<< 修改为JSONL
         try:
-            # 添加处理信息到结果中
-            enhanced_results = {
-                "processing_info": {
-                    "jsonl_file": root_folder_path,
-                    "total_images": total_original_files,
-                    "images_processed": len(all_images) + len(processed_indices_set), # 包含已处理的
-                    "processing_time": end_time - start_time,
-                },
-                "results": all_results
-            }
             with open(result_file, 'w', encoding='utf-8') as f:
-                json.dump(enhanced_results, f, ensure_ascii=False, indent=2)
+                for relative_path, result_data in all_results.items():
+                    f.write(json.dumps(result_data, ensure_ascii=False) + '\n')
+
             print(f"\n结果已保存到: {result_file}")
 
-            # *** 新增：保存错误图片列表 ***
-            # 收集所有处理失败的图片
+            # *** 新增：保存错误图片列表 (JSONL格式) ***
             error_images_list = []
             for result in results_list:
                 status = result.get("final_status", "unknown")
-                # 定义哪些状态算“错误”。这里排除了成功和不确定（包括标准化失败），只保留真正的错误。
                 if status not in ["success", "uncertain", "invalid_category", "format_error"]:
                     error_entry = {
                         "index": result["index"],
@@ -754,10 +772,11 @@ def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_d
                     error_images_list.append(error_entry)
 
             if error_images_list:
-                error_log_file = os.path.join(output_dir, f"error_images_list.json")
+                error_log_file = os.path.join(output_dir, f"error_images_list.jsonl") # <<< 修改为JSONL
                 try:
                     with open(error_log_file, 'w', encoding='utf-8') as f:
-                        json.dump(error_images_list, f, ensure_ascii=False, indent=2)
+                        for error_item in error_images_list:
+                            f.write(json.dumps(error_item, ensure_ascii=False) + '\n')
                     print(f"\n[重要] 发现 {len(error_images_list)} 个错误，详细列表已保存到: {error_log_file}")
                 except Exception as e:
                     print(f"保存错误图片列表失败: {str(e)}")
@@ -792,29 +811,6 @@ def process_images_hierarchical_parallel_sampled(root_folder_path: str, output_d
     print(f"Multiple Scenes: {category_counts[5]}")
     print(f"\n详细日志: {log_file}")
     return all_results, subfolder_results
-
-# --- 新增辅助函数用于断点续传和自动保存 ---
-def save_partial_results(partial_results, temp_file_path, lock):
-    """线程安全地保存部分结果到临时文件"""
-    with lock: # 使用传入的锁确保写入安全
-        try:
-            with open(temp_file_path, 'w', encoding='utf-8') as f:
-                json.dump(partial_results, f, ensure_ascii=False, indent=2)
-            # print(f"[DEBUG] 部分结果已保存到 {temp_file_path}") # 可选调试信息
-        except Exception as e:
-            print(f"[警告] 保存部分结果失败: {e}")
-
-def load_partial_results(temp_file_path):
-    """加载部分结果"""
-    if os.path.exists(temp_file_path):
-        try:
-            with open(temp_file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            print(f"[信息] 检测到临时文件，已加载 {len(data.get('results', []))} 条部分结果。")
-            return data
-        except Exception as e:
-            print(f"[警告] 加载临时文件失败: {e}，将重新开始处理。")
-    return None
 
 # --- 处理单张图片的函数保持不变 ---
 def process_single_image_hierarchical(args):
@@ -856,8 +852,7 @@ def process_single_image_hierarchical(args):
         "processed_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# --- 修改 main 函数 ---
-# --- 修改 main 函数 ---
+# --- 修改 main 函数 (移除预览) ---
 def main():
     # 让用户输入 JSONL 文件路径
     jsonl_file_path = input("请输入包含图片路径的 JSONL 文件路径: ").strip()
@@ -875,10 +870,6 @@ def main():
     print(f"输出目录: {output_dir}")
     print()
 
-    # --- 预览功能已移除 ---
-    # 不再尝试读取整个JSONL文件进行预览，避免大文件导致的性能问题。
-    # 程序将直接进入参数配置阶段。
-    # ************************
 
     # 询问其他处理参数
     start_from = input("\n从第几张图片开始? (默认1): ").strip()
